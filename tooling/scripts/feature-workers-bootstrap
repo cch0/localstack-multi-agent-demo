@@ -1,0 +1,44 @@
+#!/usr/bin/env bash
+# usage: feature-workers-bootstrap <machine>
+set -euo pipefail
+m="${1:?usage: feature-workers-bootstrap <machine>}"
+GIT_ALIAS_HOST="github-alias"   # empty if the remote uses github.com
+GIT_KEY="$HOME/.ssh/id_ed25519"   # the key the user confirmed
+MODEL_PROVIDER="github-copilot"
+MODEL_ID="claude-sonnet-5"
+
+if ! orb -m "$m" true >/dev/null 2>&1; then orb create ubuntu "$m"; fi
+run() { orb -m "$m" "$@"; }
+
+run sudo apt-get update
+run sudo apt-get install -y tmux nodejs npm docker.io docker-compose-v2 git-lfs make curl
+run sh -c 'curl -LsSf https://astral.sh/uv/install.sh | sudo env UV_UNMANAGED_INSTALL=/usr/local/bin sh'
+run sudo npm install -g @earendil-works/pi-coding-agent
+run sh -c 'sudo usermod -aG docker "$USER"'
+run git lfs install
+
+run sh -c "printf 'set -g extended-keys on\nset -g extended-keys-format csi-u\n' > ~/.tmux.conf"
+[ -n "$GIT_ALIAS_HOST" ] || GIT_ALIAS_HOST="github.com"
+if [ "$GIT_ALIAS_HOST" = "github.com" ]; then
+  ssh_cfg="Host github.com\n  StrictHostKeyChecking accept-new\n"
+else
+  ssh_cfg="Host $GIT_ALIAS_HOST\n  HostName github.com\n  User git\n  StrictHostKeyChecking accept-new\n"
+fi
+run sh -c "mkdir -p ~/.ssh && chmod 700 ~/.ssh && printf '$ssh_cfg' > ~/.ssh/config && chmod 600 ~/.ssh/config"
+run sh -c "[ -e ~/.ssh/$(basename "$GIT_KEY") ] || { cp '$GIT_KEY' ~/.ssh/$(basename "$GIT_KEY") && chmod 600 ~/.ssh/$(basename "$GIT_KEY"); }"
+
+mkdir -p "$HOME/.pi-workers"
+cfg="$HOME/.pi-workers/.cfg.$$"
+cat > "$cfg" <<EOF
+{
+  "defaultProvider": "$MODEL_PROVIDER",
+  "defaultModel": "$MODEL_ID"
+}
+EOF
+run sh -c "mkdir -p ~/.pi/agent && cp '$cfg' ~/.pi/agent/settings.json && cp '$HOME/.pi/agent/auth.json' ~/.pi/agent/auth.json && chmod 600 ~/.pi/agent/auth.json"
+rm -f "$cfg"
+
+run sh -c 'mkdir -p ~/.pi/agent/skills'
+
+run sh -c 'node -v; pi --version; docker --version; git lfs version; tmux -V; uv --version; make --version | head -1'
+run docker ps

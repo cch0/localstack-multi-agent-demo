@@ -1,0 +1,71 @@
+#!/usr/bin/env bash
+# usage: feature-workers new <feature> <machine> [base-branch]
+#        feature-workers status | peek <feature> [lines] | send <feature> <text> | rm <feature> [--yes]
+set -euo pipefail
+ROOT="$HOME/.pi-workers"
+EXT="$ROOT/status-ext.ts"
+slug() { echo "$1" | tr '[:upper:]' '[:lower:]' | sed 's/[^a-z0-9]/-/g'; }
+meta() { grep "^$2=" "$ROOT/$1/meta" | cut -d= -f2-; }
+
+cmd="${1:-}"; shift || true
+case "$cmd" in
+  new)
+    f=$(slug "${1:?feature}"); m="${2:?machine}"; base="${3:-}"
+    repo=$(git rev-parse --show-toplevel); wt="$repo-$f"
+    orb -m "$m" sh -c 'command -v pi >/dev/null' || { echo "$m is not set up; run feature-workers-bootstrap $m"; exit 1; }
+    for d in "$ROOT"/*/; do
+      [ -f "$d/meta" ] && grep -qx "machine=$m" "$d/meta" && { echo "$m is in use by $(basename "$d")"; exit 1; }
+    done
+    [ -e "$ROOT/$f" ] && { echo "feature $f already exists"; exit 1; }
+    git worktree add "$wt" -b "$f" $base
+    copy_list="$repo/.pi/feature-workers/copy-list"
+    if [ -f "$copy_list" ]; then
+      while IFS= read -r p || [ -n "$p" ]; do
+        if [ -n "$p" ] && [ -e "$repo/$p" ] && [ ! -e "$wt/$p" ]; then
+          mkdir -p "$(dirname "$wt/$p")"; cp -R "$repo/$p" "$wt/$p"; echo "copied $p"
+        fi
+      done < "$copy_list"
+    fi
+    worker_instructions="$repo/.pi/feature-workers/worker-instructions.md"
+    if [ -f "$worker_instructions" ] && [ ! -e "$wt/.pi/APPEND_SYSTEM.md" ]; then
+      mkdir -p "$wt/.pi"; cp "$worker_instructions" "$wt/.pi/APPEND_SYSTEM.md"; echo "copied worker instructions to .pi/APPEND_SYSTEM.md"
+    fi
+    mkdir -p "$ROOT/$f"
+    printf 'machine=%s\nrepo=%s\nbranch=%s\nworktree=%s\n' "$m" "$repo" "$f" "$wt" > "$ROOT/$f/meta"
+    orb -m "$m" tmux new-session -d -s "$f" -c "$wt" "PI_WORKER_STATE_DIR=$ROOT/$f pi --approve --extension $EXT"
+    echo "worker $f: machine $m, worktree $wt, stack at http://$m.orb.local:<port>"
+    ;;
+  status)
+    for d in "$ROOT"/*/; do
+      [ -f "$d/meta" ] || continue
+      f=$(basename "$d"); m=$(meta "$f" machine)
+      st=$(grep -o '"status":"[^"]*"' "$d/state.json" 2>/dev/null | cut -d'"' -f4 || true)
+      ts=$(grep -o '"ts":"[^"]*"' "$d/state.json" 2>/dev/null | cut -d'"' -f4 || true)
+      if orb -m "$m" tmux has-session -t "$f" 2>/dev/null; then up=up; else up=DOWN; fi
+      printf '%-20s %-12s %-6s %-14s %s\n' "$f" "$m" "$up" "${st:--}" "${ts:--}"
+    done
+    echo; echo "machines:"; orb list
+    ;;
+  peek)
+    f=$(slug "${1:?feature}"); m=$(meta "$f" machine)
+    orb -m "$m" tmux capture-pane -p -t "$f" -S "-${2:-60}"
+    ;;
+  send)
+    f=$(slug "${1:?feature}"); shift; m=$(meta "$f" machine)
+    orb -m "$m" tmux send-keys -t "$f" -l "$*"
+    orb -m "$m" tmux send-keys -t "$f" Enter
+    ;;
+  rm)
+    f=$(slug "${1:?feature}"); m=$(meta "$f" machine); wt=$(meta "$f" worktree); repo=$(meta "$f" repo)
+    if [ "${2:-}" != "--yes" ]; then
+      echo "would stop worker $f on $m, run docker compose down -v in $wt, remove worktree $wt (branch $f is kept)"
+      echo "rerun with --yes"; exit 0
+    fi
+    orb -m "$m" tmux kill-session -t "$f" 2>/dev/null || true
+    orb -m "$m" sh -c "cd '$wt' && docker compose down -v" || true
+    git -C "$repo" worktree remove --force "$wt"
+    rm -rf "$ROOT/$f"
+    echo "removed $f"
+    ;;
+  *) sed -n '2,3p' "$0"; exit 1 ;;
+esac
